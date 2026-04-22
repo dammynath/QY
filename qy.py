@@ -102,8 +102,13 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
         return 0.0
     wl_sel = wl[mask]
     int_sel = intensity[mask]
-    # Trapezoidal integration
-    area = np.trapz(int_sel, wl_sel)
+    
+    # Use np.trapezoid (replaces deprecated np.trapz) for integration
+    # Fallback for older NumPy versions
+    try:
+        area = np.trapezoid(int_sel, wl_sel)
+    except AttributeError:
+        area = np.trapz(int_sel, wl_sel)
     return area
 
 def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None):
