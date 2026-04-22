@@ -31,10 +31,10 @@ solvent_ri = {
 }
 
 # ------------------------------------------------------------
-# 3. Helper functions
+# 3. Helper functions (with defensive checks)
 # ------------------------------------------------------------
 def load_file(uploaded_file):
-    """Load CSV or Excel file into a pandas DataFrame."""
+    """Load CSV or Excel file into a pandas DataFrame. Return None if invalid."""
     if uploaded_file is None:
         return None
     try:
@@ -42,20 +42,26 @@ def load_file(uploaded_file):
             df = pd.read_csv(uploaded_file)
         else:
             df = pd.read_excel(uploaded_file)
-        # Assume first column = wavelength, second column = value
+        
         if df.shape[1] < 2:
             st.error("File must have at least two columns (wavelength, value).")
             return None
+        
         # Rename columns for consistency
         df.columns = ['wavelength', 'value'] + list(df.columns[2:])
-        return df[['wavelength', 'value']].dropna()
+        df = df[['wavelength', 'value']].dropna()
+        
+        if df.empty:
+            st.error("File contains no valid data after removing missing values.")
+            return None
+        return df
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
 
 def get_value_at_wavelength(df, target_wl, kind='linear'):
-    """Interpolate value at exact wavelength."""
-    if df is None or len(df) == 0:
+    """Interpolate value at exact wavelength. Return None if df is None or empty."""
+    if df is None or df.empty:
         return None
     wl = df['wavelength'].values
     val = df['value'].values
@@ -70,8 +76,9 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
     """
     Integrate PL spectrum over wl_range (start, end) in nm.
     baseline_method: 'constant' (subtract mean over baseline_region), 'linear', or 'none'.
+    Return None if df is None or empty.
     """
-    if df is None:
+    if df is None or df.empty:
         return None
     wl = df['wavelength'].values
     intensity = df['value'].values
@@ -83,8 +90,6 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
             baseline = np.mean(intensity[mask])
             intensity = intensity - baseline
     elif baseline_method == 'linear' and baseline_region:
-        # Linear baseline between two points (e.g., start and end of baseline region)
-        # Simpler: fit line to baseline region and subtract
         mask = (wl >= baseline_region[0]) & (wl <= baseline_region[1])
         if np.sum(mask) >= 2:
             p = np.polyfit(wl[mask], intensity[mask], 1)
@@ -104,9 +109,9 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
 def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None):
     """
     Compute peak wavelength and FWHM of the PL spectrum.
-    Returns (peak_wavelength, fwhm) in nm.
+    Returns (peak_wavelength, fwhm) in nm. Returns (None, None) if df is invalid.
     """
-    if df is None:
+    if df is None or df.empty:
         return None, None
     wl = df['wavelength'].values
     intensity = df['value'].values
@@ -228,7 +233,7 @@ with col4:
     sample_pl_file = st.file_uploader("Upload Sample PL spectrum", type=["csv", "xlsx"], key="sample_pl")
 
 # ------------------------------------------------------------
-# 7. Process data and compute
+# 7. Process data and compute (with defensive checks)
 # ------------------------------------------------------------
 if ref_abs_file and ref_pl_file and sample_abs_file and sample_pl_file:
     
@@ -238,7 +243,9 @@ if ref_abs_file and ref_pl_file and sample_abs_file and sample_pl_file:
     sample_abs_df = load_file(sample_abs_file)
     sample_pl_df = load_file(sample_pl_file)
     
-    if None in [ref_abs_df, ref_pl_df, sample_abs_df, sample_pl_df]:
+    # Check that all DataFrames are valid (not None)
+    if any(df is None for df in [ref_abs_df, ref_pl_df, sample_abs_df, sample_pl_df]):
+        st.error("One or more files could not be loaded. Please check file formats and content.")
         st.stop()
     
     # Get absorbance at excitation wavelength
