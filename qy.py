@@ -4,7 +4,6 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.interpolate import interp1d
-from scipy.signal import find_peaks
 import io
 
 # ------------------------------------------------------------
@@ -27,19 +26,33 @@ solvent_ri = {
     "Toluene": 1.496,
     "Chloroform": 1.446,
     "Hexane": 1.375,
-    "Custom": 1.000   # user can enter value
+    "Custom": 1.000
 }
 
 # ------------------------------------------------------------
-# 3. Helper functions (with defensive checks)
+# 3. Helper functions (with robust handling)
 # ------------------------------------------------------------
 def load_file(uploaded_file):
-    """Load CSV or Excel file into a pandas DataFrame. Return None if invalid."""
+    """Load CSV or Excel file with automatic delimiter detection. Return None if invalid."""
     if uploaded_file is None:
         return None
     try:
+        # Try reading with different delimiters
         if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
+            # First try comma
+            try:
+                df = pd.read_csv(uploaded_file)
+                if df.shape[1] < 2:
+                    # Try semicolon
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep=';')
+                if df.shape[1] < 2:
+                    # Try tab
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep='\t')
+            except:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, sep=';')
         else:
             df = pd.read_excel(uploaded_file)
         
@@ -47,37 +60,66 @@ def load_file(uploaded_file):
             st.error("File must have at least two columns (wavelength, value).")
             return None
         
-        # Rename columns for consistency
-        df.columns = ['wavelength', 'value'] + list(df.columns[2:])
-        df = df[['wavelength', 'value']].dropna()
+        # Assume first column = wavelength, second column = value
+        wl_col = df.columns[0]
+        val_col = df.columns[1]
+        
+        # Convert to numeric, coerce errors to NaN
+        df[wl_col] = pd.to_numeric(df[wl_col], errors='coerce')
+        df[val_col] = pd.to_numeric(df[val_col], errors='coerce')
+        
+        # Drop rows with NaN
+        df = df.dropna(subset=[wl_col, val_col])
         
         if df.empty:
-            st.error("File contains no valid data after removing missing values.")
+            st.error("No valid numeric data found in file.")
             return None
+        
+        # Rename columns for consistency
+        df = df.rename(columns={wl_col: 'wavelength', val_col: 'value'})
+        df = df[['wavelength', 'value']]
+        
+        # Sort by wavelength
+        df = df.sort_values('wavelength')
+        
         return df
     except Exception as e:
         st.error(f"Error reading file: {e}")
         return None
 
 def get_value_at_wavelength(df, target_wl, kind='linear'):
-    """Interpolate value at exact wavelength. Return None if df is None or empty."""
+    """Interpolate value at exact wavelength. Return None if fails."""
     if df is None or df.empty:
         return None
     wl = df['wavelength'].values
     val = df['value'].values
-    # Sort by wavelength
-    idx = np.argsort(wl)
-    wl = wl[idx]
-    val = val[idx]
-    f = interp1d(wl, val, kind=kind, fill_value='extrapolate')
-    return float(f(target_wl))
+    
+    # Ensure strictly increasing wavelength
+    if not np.all(np.diff(wl) > 0):
+        # Remove duplicates and sort
+        df = df.drop_duplicates(subset='wavelength')
+        df = df.sort_values('wavelength')
+        wl = df['wavelength'].values
+        val = df['value'].values
+    
+    # Check if target wavelength is within range (allow small extrapolation)
+    wl_min, wl_max = wl.min(), wl.max()
+    if target_wl < wl_min or target_wl > wl_max:
+        st.warning(f"Target wavelength {target_wl} nm is outside the measured range ({wl_min:.1f}–{wl_max:.1f} nm). Extrapolating.")
+        # Still try but limit extrapolation to 50 nm
+        if target_wl < wl_min - 50 or target_wl > wl_max + 50:
+            st.error(f"Target wavelength too far outside measured range. Please measure absorbance at {target_wl} nm.")
+            return None
+    
+    try:
+        f = interp1d(wl, val, kind=kind, fill_value='extrapolate')
+        return float(f(target_wl))
+    except Exception as e:
+        st.error(f"Interpolation failed: {e}")
+        return None
 
 def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region=None):
-    """
-    Integrate PL spectrum over wl_range (start, end) in nm.
-    baseline_method: 'constant' (subtract mean over baseline_region), 'linear', or 'none'.
-    Return None if df is None or empty.
-    """
+    """Integrate PL spectrum. Return None if fails."""
     if df is None or df.empty:
         return None
     wl = df['wavelength'].values
@@ -103,8 +145,7 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
     wl_sel = wl[mask]
     int_sel = intensity[mask]
     
-    # Use np.trapezoid (replaces deprecated np.trapz) for integration
-    # Fallback for older NumPy versions
+    # Integration (compatible with old and new NumPy)
     try:
         area = np.trapezoid(int_sel, wl_sel)
     except AttributeError:
@@ -112,16 +153,13 @@ def integrate_spectrum(df, wl_range, baseline_method='constant', baseline_region
     return area
 
 def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None):
-    """
-    Compute peak wavelength and FWHM of the PL spectrum.
-    Returns (peak_wavelength, fwhm) in nm. Returns (None, None) if df is invalid.
-    """
+    """Compute peak wavelength and FWHM. Returns (peak_wl, fwhm)."""
     if df is None or df.empty:
         return None, None
     wl = df['wavelength'].values
     intensity = df['value'].values
     
-    # Apply same baseline correction as for integration
+    # Apply baseline correction
     if baseline_method == 'constant' and baseline_region:
         mask = (wl >= baseline_region[0]) & (wl <= baseline_region[1])
         if np.any(mask):
@@ -134,7 +172,7 @@ def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None)
             baseline_line = np.polyval(p, wl)
             intensity = intensity - baseline_line
     
-    # Restrict to region of interest (avoid noise)
+    # Restrict to region of interest
     mask_range = (wl >= wl_range[0]) & (wl <= wl_range[1])
     if not np.any(mask_range):
         return None, None
@@ -146,25 +184,23 @@ def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None)
     peak_wl = wl_peak[max_idx]
     max_int = int_peak[max_idx]
     
-    # Find half maximum
+    if max_int <= 0:
+        return peak_wl, None
+    
     half_max = max_int / 2.0
-    # Find indices where intensity crosses half_max on left and right
     left_idx = np.where(int_peak[:max_idx] <= half_max)[0]
     right_idx = np.where(int_peak[max_idx:] <= half_max)[0]
     
     if len(left_idx) == 0 or len(right_idx) == 0:
         return peak_wl, None
     
-    left_cross = left_idx[-1]   # last index before peak where intensity <= half_max
+    left_cross = left_idx[-1]
     right_cross = right_idx[0] + max_idx
     
-    # Interpolate for more precise FWHM
-    # Left side
+    # Interpolate left
     if left_cross < len(wl_peak)-1:
-        wl1 = wl_peak[left_cross]
-        wl2 = wl_peak[left_cross+1]
-        int1 = int_peak[left_cross]
-        int2 = int_peak[left_cross+1]
+        wl1, wl2 = wl_peak[left_cross], wl_peak[left_cross+1]
+        int1, int2 = int_peak[left_cross], int_peak[left_cross+1]
         if int2 != int1:
             frac = (half_max - int1) / (int2 - int1)
             left_wl = wl1 + frac * (wl2 - wl1)
@@ -173,12 +209,10 @@ def compute_fwhm(df, wl_range, baseline_method='constant', baseline_region=None)
     else:
         left_wl = wl_peak[left_cross]
     
-    # Right side
+    # Interpolate right
     if right_cross < len(wl_peak)-1:
-        wl1 = wl_peak[right_cross]
-        wl2 = wl_peak[right_cross+1]
-        int1 = int_peak[right_cross]
-        int2 = int_peak[right_cross+1]
+        wl1, wl2 = wl_peak[right_cross], wl_peak[right_cross+1]
+        int1, int2 = int_peak[right_cross], int_peak[right_cross+1]
         if int2 != int1:
             frac = (half_max - int1) / (int2 - int1)
             right_wl = wl1 + frac * (wl2 - wl1)
@@ -204,8 +238,8 @@ baseline_region = (baseline_start, baseline_end) if baseline_method != "none" el
 ref_qy = st.sidebar.number_input("Reference quantum yield (e.g., R6G in ethanol)", value=0.95, step=0.01)
 
 st.sidebar.subheader("Solvent Refractive Indices")
-ref_solvent = st.sidebar.selectbox("Reference solvent", list(solvent_ri.keys()), index=1)  # Ethanol default
-sample_solvent = st.sidebar.selectbox("Sample solvent", list(solvent_ri.keys()), index=0)  # Water default
+ref_solvent = st.sidebar.selectbox("Reference solvent", list(solvent_ri.keys()), index=1)
+sample_solvent = st.sidebar.selectbox("Sample solvent", list(solvent_ri.keys()), index=0)
 
 if ref_solvent == "Custom":
     ref_ri = st.sidebar.number_input("Reference solvent RI", value=1.361)
@@ -218,7 +252,7 @@ else:
     sample_ri = solvent_ri[sample_solvent]
 
 # ------------------------------------------------------------
-# 5. File uploads for Reference
+# 5. File uploads
 # ------------------------------------------------------------
 st.header("📘 Reference (e.g., Rhodamine 6G)")
 col1, col2 = st.columns(2)
@@ -227,9 +261,6 @@ with col1:
 with col2:
     ref_pl_file = st.file_uploader("Upload Reference PL spectrum", type=["csv", "xlsx"], key="ref_pl")
 
-# ------------------------------------------------------------
-# 6. File uploads for Sample (Quantum Dot)
-# ------------------------------------------------------------
 st.header("🔬 Sample (Quantum Dot)")
 col3, col4 = st.columns(2)
 with col3:
@@ -238,30 +269,25 @@ with col4:
     sample_pl_file = st.file_uploader("Upload Sample PL spectrum", type=["csv", "xlsx"], key="sample_pl")
 
 # ------------------------------------------------------------
-# 7. Process data and compute (with defensive checks)
+# 6. Process data
 # ------------------------------------------------------------
 if ref_abs_file and ref_pl_file and sample_abs_file and sample_pl_file:
     
-    # Load all data
     ref_abs_df = load_file(ref_abs_file)
     ref_pl_df = load_file(ref_pl_file)
     sample_abs_df = load_file(sample_abs_file)
     sample_pl_df = load_file(sample_pl_file)
     
-    # Check that all DataFrames are valid (not None)
     if any(df is None for df in [ref_abs_df, ref_pl_df, sample_abs_df, sample_pl_df]):
-        st.error("One or more files could not be loaded. Please check file formats and content.")
         st.stop()
     
-    # Get absorbance at excitation wavelength
     A_ref = get_value_at_wavelength(ref_abs_df, ex_wl)
     A_sample = get_value_at_wavelength(sample_abs_df, ex_wl)
     
     if A_ref is None or A_sample is None:
-        st.error(f"Could not interpolate absorbance at {ex_wl} nm. Check your absorbance files.")
+        st.error(f"Could not get absorbance at {ex_wl} nm. Check files.")
         st.stop()
     
-    # Integrate PL spectra
     I_ref = integrate_spectrum(ref_pl_df, int_range, baseline_method, baseline_region)
     I_sample = integrate_spectrum(sample_pl_df, int_range, baseline_method, baseline_region)
     
@@ -269,104 +295,56 @@ if ref_abs_file and ref_pl_file and sample_abs_file and sample_pl_file:
         st.error("Integration failed. Check PL files and range.")
         st.stop()
     
-    # Compute FWHM and peak wavelength for sample PL
     peak_wl, fwhm = compute_fwhm(sample_pl_df, int_range, baseline_method, baseline_region)
     
-    # Quantum yield calculation
     ri_corr = (sample_ri / ref_ri) ** 2
     qy = ref_qy * (I_sample / I_ref) * (A_ref / A_sample) * ri_corr
     
-    # --------------------------------------------------------
-    # 8. Display results
-    # --------------------------------------------------------
+    # Display results
     st.header("📊 Results")
-    col_res1, col_res2, col_res3 = st.columns(3)
-    col_res1.metric("Reference Absorbance", f"{A_ref:.5f}")
-    col_res2.metric("Sample Absorbance", f"{A_sample:.5f}")
-    col_res3.metric("Refractive Index Correction", f"{ri_corr:.4f}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Reference Absorbance", f"{A_ref:.5f}")
+    col2.metric("Sample Absorbance", f"{A_sample:.5f}")
+    col3.metric("RI Correction", f"{ri_corr:.4f}")
     
-    col_res4, col_res5, col_res6 = st.columns(3)
-    col_res4.metric("Reference Integrated Area", f"{I_ref:.2f}")
-    col_res5.metric("Sample Integrated Area", f"{I_sample:.2f}")
-    col_res6.metric("Sample PL Peak (nm)", f"{peak_wl:.1f}" if peak_wl else "N/A")
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Ref Integrated Area", f"{I_ref:.2f}")
+    col5.metric("Sample Integrated Area", f"{I_sample:.2f}")
+    col6.metric("PL Peak (nm)", f"{peak_wl:.1f}" if peak_wl else "N/A")
     
-    col_res7, col_res8 = st.columns(2)
-    col_res7.metric("Sample FWHM (nm)", f"{fwhm:.1f}" if fwhm else "N/A")
-    col_res8.metric("Quantum Yield", f"{qy:.4f}  ({qy*100:.2f}%)")
+    col7, col8 = st.columns(2)
+    col7.metric("FWHM (nm)", f"{fwhm:.1f}" if fwhm else "N/A")
+    col8.metric("Quantum Yield", f"{qy:.4f} ({qy*100:.2f}%)")
     
-    # --------------------------------------------------------
-    # 9. Plotting
-    # --------------------------------------------------------
+    # Plotting (simplified)
     st.subheader("📈 Spectra")
-    
-    # Create subplots
-    fig = make_subplots(rows=2, cols=2, 
-                        subplot_titles=("Reference Absorbance", "Reference PL", 
-                                        "Sample Absorbance", "Sample PL"))
-    
-    # Reference Absorbance
-    fig.add_trace(go.Scatter(x=ref_abs_df['wavelength'], y=ref_abs_df['value'], 
-                             mode='lines', name='Ref Abs'), row=1, col=1)
+    fig = make_subplots(rows=2, cols=2, subplot_titles=("Ref Abs", "Ref PL", "Sample Abs", "Sample PL"))
+    fig.add_trace(go.Scatter(x=ref_abs_df['wavelength'], y=ref_abs_df['value'], mode='lines'), row=1, col=1)
     fig.add_vline(x=ex_wl, line_dash="dash", line_color="red", row=1, col=1)
-    
-    # Reference PL
-    fig.add_trace(go.Scatter(x=ref_pl_df['wavelength'], y=ref_pl_df['value'], 
-                             mode='lines', name='Ref PL'), row=1, col=2)
-    fig.add_vrect(x0=int_range[0], x1=int_range[1], fillcolor="gray", opacity=0.2, 
-                  line_width=0, row=1, col=2)
-    
-    # Sample Absorbance
-    fig.add_trace(go.Scatter(x=sample_abs_df['wavelength'], y=sample_abs_df['value'], 
-                             mode='lines', name='Sample Abs'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=ref_pl_df['wavelength'], y=ref_pl_df['value'], mode='lines'), row=1, col=2)
+    fig.add_vrect(x0=int_range[0], x1=int_range[1], fillcolor="gray", opacity=0.2, row=1, col=2)
+    fig.add_trace(go.Scatter(x=sample_abs_df['wavelength'], y=sample_abs_df['value'], mode='lines'), row=2, col=1)
     fig.add_vline(x=ex_wl, line_dash="dash", line_color="red", row=2, col=1)
-    
-    # Sample PL
-    fig.add_trace(go.Scatter(x=sample_pl_df['wavelength'], y=sample_pl_df['value'], 
-                             mode='lines', name='Sample PL'), row=2, col=2)
-    fig.add_vrect(x0=int_range[0], x1=int_range[1], fillcolor="gray", opacity=0.2, 
-                  line_width=0, row=2, col=2)
+    fig.add_trace(go.Scatter(x=sample_pl_df['wavelength'], y=sample_pl_df['value'], mode='lines'), row=2, col=2)
+    fig.add_vrect(x0=int_range[0], x1=int_range[1], fillcolor="gray", opacity=0.2, row=2, col=2)
     if peak_wl:
         fig.add_vline(x=peak_wl, line_dash="dash", line_color="green", row=2, col=2)
-    
     fig.update_layout(height=800, showlegend=False)
-    fig.update_xaxes(title_text="Wavelength (nm)", row=1, col=1)
-    fig.update_xaxes(title_text="Wavelength (nm)", row=1, col=2)
-    fig.update_xaxes(title_text="Wavelength (nm)", row=2, col=1)
-    fig.update_xaxes(title_text="Wavelength (nm)", row=2, col=2)
-    fig.update_yaxes(title_text="Absorbance", row=1, col=1)
-    fig.update_yaxes(title_text="Intensity (a.u.)", row=1, col=2)
-    fig.update_yaxes(title_text="Absorbance", row=2, col=1)
-    fig.update_yaxes(title_text="Intensity (a.u.)", row=2, col=2)
-    
     st.plotly_chart(fig, use_container_width=True)
     
-    # --------------------------------------------------------
-    # 10. Download results
-    # --------------------------------------------------------
+    # Download results
     results_df = pd.DataFrame({
-        "Parameter": ["Excitation wavelength (nm)", "Integration range (nm)", 
-                      "Baseline method", "Baseline region (nm)",
-                      "Reference QY", "Reference solvent (RI)", "Sample solvent (RI)",
-                      "A_ref", "A_sample", "I_ref", "I_sample", 
-                      "Refractive index correction", "Sample PL peak (nm)", "Sample FWHM (nm)",
-                      "Quantum yield"],
-        "Value": [ex_wl, f"{int_range[0]}–{int_range[1]}", 
-                  baseline_method, f"{baseline_region[0]}–{baseline_region[1]}" if baseline_region else "None",
+        "Parameter": ["Excitation (nm)", "Integration range (nm)", "Baseline method", "Baseline region (nm)",
+                      "Reference QY", "Ref solvent (RI)", "Sample solvent (RI)",
+                      "A_ref", "A_sample", "I_ref", "I_sample", "RI correction", "PL peak (nm)", "FWHM (nm)", "Quantum yield"],
+        "Value": [ex_wl, f"{int_range[0]}–{int_range[1]}", baseline_method,
+                  f"{baseline_region[0]}–{baseline_region[1]}" if baseline_region else "None",
                   ref_qy, f"{ref_solvent} ({ref_ri:.3f})", f"{sample_solvent} ({sample_ri:.3f})",
                   f"{A_ref:.5f}", f"{A_sample:.5f}", f"{I_ref:.2f}", f"{I_sample:.2f}",
-                  f"{ri_corr:.4f}", f"{peak_wl:.1f}" if peak_wl else "N/A", 
+                  f"{ri_corr:.4f}", f"{peak_wl:.1f}" if peak_wl else "N/A",
                   f"{fwhm:.1f}" if fwhm else "N/A", f"{qy:.4f} ({qy*100:.2f}%)"]
     })
-    
     csv = results_df.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download results as CSV", data=csv, 
-                       file_name="quantum_yield_results.csv", mime="text/csv")
-    
+    st.download_button("📥 Download CSV", data=csv, file_name="quantum_yield_results.csv", mime="text/csv")
 else:
-    st.info("👈 Please upload all four files (absorbance and PL for both reference and sample) to begin calculation.")
-
-# ------------------------------------------------------------
-# 11. Footer
-# ------------------------------------------------------------
-st.markdown("---")
-st.markdown("Developed for quantum yield determination using the comparative method. Ensure that all spectra are measured under identical instrument settings and that the reference's quantum yield is known at the chosen excitation wavelength.")
+    st.info("👈 Upload all four files to begin.")
